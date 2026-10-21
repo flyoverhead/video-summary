@@ -1,0 +1,5 @@
+schema_version: "1.1"
+name: outcome-start-interview
+tags: [outcome]
+context:
+  scaffold_script: setup.sh

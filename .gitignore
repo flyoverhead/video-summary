@@ -1,0 +1,11 @@
+.superpowers/
+.ansible-lint
+.pre-commit-config.yaml
+.tflint.hcl
+.yamllint
+__pycache__/
+.pytest_cache/
+.eval-out/
+.DS_Store
+**/evals/results/
+docs/superpowers/

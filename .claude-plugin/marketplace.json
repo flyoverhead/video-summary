@@ -1,0 +1,15 @@
+{
+  "name": "video-summary",
+  "owner": {
+    "email": "flypatriotka@gmail.com",
+    "name": "Aleksandr Letunov"
+  },
+  "plugins": [
+    {
+      "description": "Summarise raw camera footage into a short edited video: analysis, clip planning, render and verification with ffmpeg.",
+      "name": "video-summary",
+      "source": "./video-summary",
+      "version": "0.1.0"
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+schema_version: "1.1"
+name: trigger-grade
+tags: [trigger]
+context:
+  scaffold_script: setup.sh

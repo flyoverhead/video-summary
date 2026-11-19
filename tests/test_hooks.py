@@ -158,3 +158,37 @@ def test_hooks_json():
         entry = data['hooks'][event][0]
         assert entry['matcher'] == 'Bash'
         assert entry['hooks'][0]['command'] == f'python3 "${{CLAUDE_PLUGIN_ROOT}}/hooks/{name}"'
+
+
+def test_hooks_handle_pilot_draft(rendered_project, tmp_path):
+    import render_summary
+    dest = tmp_path / 'pilot'
+    shutil.copytree(rendered_project['project'], dest)
+    config = json.loads((dest / 'config.json').read_text())
+    config.update(src=str(dest), out=str(dest / 'SUMMARY_VIDEO.mp4'), tmp=str(tmp_path / 'tmp'))
+    (dest / 'config.json').write_text(json.dumps(config))
+    clips = json.loads((dest / 'clips.json').read_text())
+    probe = json.loads((dest / 'probe.json').read_text())
+    out = render_summary.render(config, clips, probe, draft=True, clip_range=(2, 3))
+    cmd = f'python3 {RENDER} --draft --clips 2-3 "{dest}"'
+    assert _hook(PRE, _bash(cmd)).returncode == 0
+    (dest / 'clips.json').write_text('[]')
+    assert _hook(PRE, _bash(cmd)).returncode == 2
+    (dest / 'clips.json').write_text(json.dumps(clips))
+    context = _context(_hook(POST, _bash(cmd, tool_response={'output': f'Done!  {out}\n'})))
+    assert context.rstrip().endswith('OK')
+
+
+def test_post_hook_skips_qa(rendered_project, monkeypatch, capsys):
+    import io
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('post_render_under_test', POST)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    seen = {}
+    monkeypatch.setattr(module, 'report', lambda project, **kw: seen.update(kw) or (['OK'], True))
+    payload = _bash(f'python3 {RENDER} {rendered_project["project"]}',
+                    tool_response={'output': f'Done!  {rendered_project["out"]}\n'})
+    monkeypatch.setattr('sys.stdin', io.StringIO(json.dumps(payload)))
+    module.main()
+    assert seen.get('qa') is False

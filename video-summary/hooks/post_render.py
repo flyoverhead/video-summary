@@ -39,7 +39,7 @@ def main() -> None:
     project = render_project(command, cwd)
     if not out or project is None or not (project / 'config.json').exists():
         return
-    lines, _ = report(project, draft=out.endswith('.draft.mp4'))
+    lines, _ = report(project, draft=out.endswith('.draft.mp4'), qa=False)
     context = 'Post-render check (verify.py):\n' + '\n'.join(lines)
     print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PostToolUse', 'additionalContext': context}}))
 

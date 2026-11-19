@@ -67,12 +67,14 @@ def video_filter(clip: dict, src: dict, frame: dict, lut: Path | None, font: Pat
     return ','.join(chain)
 
 
-def audio_filter(src: dict) -> str | None:
+def audio_filter(src: dict, duration: float, fade_s: float) -> str | None:
     if src.get('audio_channels', 0) < 1:
         return None
     # DJI alternates mono/stereo between clips and the right mic is noisy; keeping only the left
     # channel gives every intermediate the same layout, which concat needs to keep audio.
-    return 'pan=mono|c0=c0,aresample=48000,apad'
+    out_start = max(0.0, duration - fade_s)
+    return (f'pan=mono|c0=c0,aresample=48000,apad,afade=t=in:d={fade_s:.3f},'
+            f'afade=t=out:st={out_start:.3f}:d={fade_s:.3f}')
 
 
 def music_args(music: dict, video_s: float) -> list[str]:

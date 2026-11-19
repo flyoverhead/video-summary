@@ -21,7 +21,7 @@ Copy and track:
 - [ ] 2. Offer a re-scan for every not-found must-find; re-score, re-group, re-show
 - [ ] 3. Routine groups: user vetoes or swaps picks (moments.py pick)
 - [ ] 4. Dispatch video-summary:clip-editor
-- [ ] 5. Show the clip table; adjust until the user confirms
+- [ ] 5. Snap the draft to pauses, show the clip table; adjust until the user confirms
 - [ ] 6. Write clips.json, config.json, SUMMARY.md (project.py write)
 ```
 
@@ -75,7 +75,7 @@ Then score the new candidates exactly as `video-summary:analyze` step 4 (`moment
 to; a still-missing moment is reported, never hidden. If the user says it is not in the footage,
 note that and move on.
 
-## 3. Routine groups
+## 3. Routine groups (B-roll)
 
 Ask whether any collapse is wrong, in one numbered message listing the groups. The user can:
 
@@ -108,7 +108,12 @@ Dispatch `video-summary:clip-editor` (Agent tool, that exact `subagent_type`) wi
 brief.json: <project>/brief.json
 digest: <path printed by digest>
 shapes.md: ${CLAUDE_PLUGIN_ROOT}/skills/start/references/shapes.md
+preferences: <path printed by prefs.py show --path>
 ```
+
+Add the `preferences:` line only when that file exists (`prefs.py show` prints
+`no preferences (...)` when it does not, and then the line is left out). Tell the user how many
+saved rules the editor was given.
 
 Re-run `digest` before every dispatch: it reflects the current scores, groups and LUT.
 
@@ -117,6 +122,45 @@ must-find coverage, exclusions, force overrides, story arc). Parse the array; if
 JSON, re-dispatch once with the parse error.
 
 ## 5. Clip table
+
+Cut on pause first: pipe the drafted array through `snap` (stdin, no scratch file in the
+project). It prints the array with every clip edge that lands inside a spoken segment moved
+outward to the nearest pause (within 1.5 s; never inward), and one note per edge on stderr:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/moments.py" "<project>" snap - <<'JSON'
+[{"file": "22.08/DJI_0001_D.MP4", "start": 10.0, "duration": 8.0, "label": "Old Town Square", "lut": true}]
+JSON
+```
+
+Use the printed array as the draft. Notes read `#7 start 30.0 → 28.6 (mid-speech)` (moved) or
+`#9 end 41.0 inside speech, no pause within 1.5 s` (left as is), or
+`#8 start 16.4 → 16.7 (clamped to #7 end)` (stopped where the neighbouring same-file clip begins or ends). Show them with the table as
+"cut on pause" so the user sees what moved and which edges still cut speech. Clips whose file
+has no transcript pass through unchanged.
+
+`snap` also skips the mic switch-on mute: a clip never plays the digital mute a DJI Mic Mini
+leaves when the camera starts recording (one 0.6–0.8 s gap in the first ~3.5 s of the file; see
+[dji-known-issues.md](../render/references/dji-known-issues.md#mute-when-recording-starts)).
+It scans the first 5 s of each source file (audio decode only; nothing is written) and, for every
+clip whose window overlaps the gap, moves `start` to 0.1 s after the gap and keeps the end. Notes
+read `#5 start 0.0 → 1.8 (mic switch-on mute)`, or `#5 inside mic switch-on mute, not moved` when
+the whole clip sits in the gap. Re-check that each required must-find frame time is still inside a
+clip, and show the moved starts with the table as "mic switch-on mute skipped". A file without
+such a gap, or without audio, is untouched.
+
+Then render the contact sheet of the snapped array (same stdin form; frames and pages go to
+the cache, nothing into the project):
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/project.py" sheet "<project>" - <<'JSON'
+[ ...the snapped array... ]
+JSON
+```
+
+It prints one PNG path per page (6 × 8 tiles, each the middle frame of a clip, labelled `#N label`).
+Show the paths next to the table as "contact sheet: open to see the cut". Re-run it after any
+edit that changes the clips.
 
 Show every clip, then the summary:
 
@@ -148,7 +192,9 @@ Tram`), apply them to the array yourself, keep `start + duration` within the fil
 `probe.json` duration, and re-show the changed rows plus the new total. If the total leaves the
 target by more than 15 %, say so and offer: trim the longest clips, the user names cuts, or keep
 it. Changes to `force_include` / `force_exclude` / target go into `brief.json` (step 6 rules),
-then re-dispatch the editor. Loop until the user confirms the table.
+then re-dispatch the editor. After the user's own edits run only `snap - --check` on the
+array (same stdin form; it changes nothing) and show its lines (`#7 start 30.0 inside speech`)
+as warnings; never snap an edge the user set. Loop until the user confirms the table.
 
 ## 6. Write the files
 

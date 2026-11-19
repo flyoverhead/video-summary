@@ -34,3 +34,16 @@ Match the user's own words to the closest row; mixed tones take the first one na
 - No tone given: use the joyful row for trip and everyday, energetic for sport.
 - Tone never removes a `must_find` match or a `force_include` clip; it only changes their length.
 - Reactions (laughter, surprise) keep 1–2 s after the peak in every tone.
+
+## Editing vocabulary
+
+Terms the skills and agents use for the cut.
+
+| Term | Meaning here |
+|---|---|
+| A-cut | The main storyline: highlight clips in story order, the material the viewer follows. |
+| B-roll | Cutaway footage over the story: the single pick of each routine group (walking, transit, views). |
+| Cut on pause | Clip edges snapped outward to the nearest silence (`moments.py snap`) so no clip starts or ends mid-utterance; edges the user set by hand are never moved. |
+| Contact sheet | Pages of frames from every clip of the drafted cut, shown beside the clip table before the user confirms. |
+| Pilot render | A draft of a clip range only (`--clips`), to check pacing and joins before the full render. |
+| J/L cut | Audio leading or trailing the picture across a join. Not used: joins keep picture and sound together and get 50 ms audio fades to remove clicks. |

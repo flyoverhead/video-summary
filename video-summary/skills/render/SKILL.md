@@ -59,7 +59,7 @@ are scaled into the frame over a blurred copy of themselves, never cropped: say 
 One numbered message:
 
 ```
-1. Render a draft first (720 px, fast, replaces any previous SUMMARY_VIDEO.draft.mp4), go
+1. Render a draft first (for more than 30 clips: a pilot of the first 12 clips or a range you name; 720 px, fast, replaces any previous SUMMARY_VIDEO.draft.mp4), go
    straight to the final, or change something first?
 ```
 
@@ -85,6 +85,19 @@ Progress lines are `[12/74] file [start→end] "label"`; the last line is
 speed = planned duration ÷ elapsed seconds; report it (`draft took 6m 10s, 2.1x realtime`).
 Run `video-summary:verify` in draft mode, then ask the user to watch the draft: any change goes
 to `video-summary:plan`, and the draft is re-rendered on request.
+
+### Pilot render
+
+When the cut has more than 30 clips, offer a pilot before the full draft: the first 12 clips or a
+range the user names. A pilot is a draft (replaces `SUMMARY_VIDEO.draft.mp4` and
+`render-manifest.draft.json`); `--clips LO-HI` is 1-based and inclusive, `N` means `N-N`, and it
+needs `--draft`:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/render_summary.py" "<project>" --draft --clips 1-12
+```
+
+`video-summary:verify --draft` checks the pilot against that clip range only.
 
 ## 4. Final
 

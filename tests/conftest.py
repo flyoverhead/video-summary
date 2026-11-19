@@ -13,7 +13,9 @@ from common import run  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _isolated_cache(tmp_path_factory, monkeypatch):
-    monkeypatch.setattr(common, 'CACHE_ROOT', tmp_path_factory.mktemp('cache'))
+    root = tmp_path_factory.mktemp('cache')
+    monkeypatch.setattr(common, 'CACHE_ROOT', root)
+    monkeypatch.setenv('VIDEO_SUMMARY_CACHE_DIR', str(root))
 
 
 def _encoders():
@@ -150,5 +152,51 @@ def rendered_project(tmp_path_factory, square_clip, vertical_clip, silent_clip):
         'config': config,
         'clips': clips,
         'out': out,
-        'manifest': Path(config['tmp']) / 'render-manifest.json',
+        'manifest': Path(config['tmp']) / 'render-manifest.final.json',
     }
+
+
+FAKE_WHISPER = '''#!/usr/bin/env python3
+import json
+import os
+import sys
+
+args = sys.argv[1:]
+if '--help' in args:
+    sys.exit(0)
+base = args[args.index('-of') + 1]
+payload = os.environ.get('FAKE_WHISPER_PAYLOAD')
+if payload:
+    data = json.load(open(payload))
+else:
+    data = {'transcription': [{'timestamps': {'from': '00:00:00,500', 'to': '00:00:01,500'},
+                               'offsets': {'from': 500, 'to': 1500}, 'text': ' look at this'}]}
+with open(base + '.json', 'w') as fh:
+    json.dump(data, fh)
+sys.exit(int(os.environ.get('FAKE_WHISPER_EXIT', '0')))
+'''
+
+
+@pytest.fixture
+def fake_whisper(monkeypatch, tmp_path):
+    bin_path = tmp_path / 'fake-whisper-cli'
+    bin_path.write_text(FAKE_WHISPER)
+    bin_path.chmod(0o755)
+    model = tmp_path / 'ggml-fake.bin'
+    model.write_bytes(b'model')
+    monkeypatch.setenv('VIDEO_SUMMARY_WHISPER_BIN', str(bin_path))
+    monkeypatch.setenv('VIDEO_SUMMARY_WHISPER_MODEL', str(model))
+    return bin_path
+
+
+def write_stub_transcripts(root, segments=(), cache_root=None):
+    import speech
+
+    old = common.CACHE_ROOT
+    if cache_root is not None:
+        common.CACHE_ROOT = Path(cache_root)
+    try:
+        for file in speech._eligible(root):
+            speech._write_transcript(root, file, 'en', list(segments), [], None)
+    finally:
+        common.CACHE_ROOT = old

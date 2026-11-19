@@ -23,7 +23,8 @@ def snapshot(root: Path) -> dict:
 
 
 def test_pipeline_only_adds_allowlisted_files(project, tmp_path):
-    env = {**os.environ, 'HOME': str(tmp_path / 'home')}
+    home = tmp_path / 'home'
+    env = {**os.environ, 'HOME': str(home), 'VIDEO_SUMMARY_CACHE_DIR': str(home / '.cache' / 'video-summary')}
 
     def cli(script, *args, stdin=None):
         proc = subprocess.run([sys.executable, str(SCRIPTS / script), *map(str, args)], input=stdin,
@@ -37,6 +38,9 @@ def test_pipeline_only_adds_allowlisted_files(project, tmp_path):
              'quality': 60, 'music': None, 'force_include': [], 'force_exclude': []}
     cli('project.py', 'write', project, 'brief.json', '-', stdin=json.dumps(brief))
     cli('probe.py', project)
+    sys.path.insert(0, str(SCRIPTS.parent.parent / 'tests'))
+    from conftest import write_stub_transcripts
+    write_stub_transcripts(project, cache_root=Path(env['HOME']) / '.cache' / 'video-summary')
     cli('sample.py', project)
     batches = [line.split('\t') for line in cli('moments.py', project, 'pending').splitlines()]
     for scores_path, inputs, _ in batches:

@@ -1,3 +1,5 @@
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -122,3 +124,27 @@ def test_cache_dir_distinct_for_same_name_outside_camera(monkeypatch, tmp_path):
     assert ca != cb
     assert ca.name.startswith('trip-') and cb.name.startswith('trip-')
     assert common.cache_dir(a) == ca
+
+
+SCRIPTS = Path(__file__).resolve().parent.parent / 'video-summary' / 'scripts'
+
+
+def _cache_root_of(env):
+    out = subprocess.run([sys.executable, '-c', 'import common; print(common.CACHE_ROOT)'],
+                         cwd=SCRIPTS, env=env, capture_output=True, text=True, check=True)
+    return out.stdout.strip()
+
+
+def test_cache_root_env_override(tmp_path):
+    env = {**os.environ, 'PYTHONPATH': str(SCRIPTS), 'VIDEO_SUMMARY_CACHE_DIR': str(tmp_path / 'c')}
+    assert _cache_root_of(env) == str(tmp_path / 'c')
+
+
+def test_cache_root_default_without_env():
+    env = {k: v for k, v in os.environ.items() if k != 'VIDEO_SUMMARY_CACHE_DIR'}
+    env['PYTHONPATH'] = str(SCRIPTS)
+    assert _cache_root_of(env).endswith('.cache/video-summary')
+
+
+def test_isolated_cache_sets_env():
+    assert os.environ['VIDEO_SUMMARY_CACHE_DIR'] == str(common.CACHE_ROOT)

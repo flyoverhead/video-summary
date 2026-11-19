@@ -1,13 +1,15 @@
 import argparse
 import json
 import math
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from common import cache_dir, defaults, read_json, write_output  # noqa: E402
+from common import cache_dir, defaults, read_json, run, write_output  # noqa: E402
+import speech  # noqa: E402
 
 
 def rank(score: dict) -> float:
@@ -257,11 +259,31 @@ def process_labels(moments: dict) -> list[str]:
                    if isinstance(sc, dict) and isinstance(sc.get('process'), str)})
 
 
-def batch_input(moments: dict, probe: dict, ids: list[str]) -> dict:
+def said_map(root: Path, moments: dict, ids: list[str]) -> dict[str, str]:
+    cfg = defaults()['speech']
+    cands = {c['id']: c for c in moments['candidates']}
+    segments: dict[str, list[dict]] = {}
+    said = {}
+    for cid in ids:
+        file = cands[cid]['file']
+        if file not in segments:
+            transcript = speech.load_transcript(root, file)
+            segments[file] = transcript['segments'] if transcript else []
+        text = speech.said_at(segments[file], cands[cid]['t'], cfg['said_before_s'], cfg['said_after_s'],
+                              cfg['said_max_chars'])
+        if text:
+            said[cid] = text
+    return said
+
+
+def batch_input(moments: dict, probe: dict, ids: list[str], said: dict[str, str] | None = None) -> dict:
     durations = {c['file']: c['duration'] for c in probe['clips']}
     cands = {c['id']: c for c in moments['candidates']}
     rows = [{'id': cid, 'file': cands[cid]['file'], 't': cands[cid]['t'], 'thumb': cands[cid]['thumb'],
              'duration': durations.get(cands[cid]['file'])} for cid in ids]
+    for row in rows:
+        if said and row['id'] in said:
+            row['said'] = said[row['id']]
     return {'candidates': rows, 'process_labels': process_labels(moments)}
 
 
@@ -275,7 +297,8 @@ def pending_batches(root: Path, batch: int) -> list[tuple[Path, Path, list[str]]
     batches = []
     for chunk in (ids[i:i + batch] for i in range(0, len(ids), batch)):
         inputs = scores_dir / f'input-{chunk[0]}.json'
-        inputs.write_text(json.dumps(batch_input(moments, probe, chunk), ensure_ascii=False) + '\n')
+        inputs.write_text(json.dumps(batch_input(moments, probe, chunk, said_map(root, moments, chunk)),
+                                       ensure_ascii=False) + '\n')
         scores_path = scores_dir / f'batch-{chunk[0]}.json'
         scores_path.unlink(missing_ok=True)
         batches.append((scores_path, inputs, chunk))
@@ -289,15 +312,18 @@ def _clip_keys(probe: dict) -> dict[str, str]:
     return {c['file']: f'f{n}' for n, c in enumerate(probe['clips'], 1)}
 
 
-def _candidate_line(cid: str, cand: dict, sc: dict, key: str) -> str:
+def _candidate_line(cid: str, cand: dict, sc: dict, key: str, said: str | None = None) -> str:
     kind = 'R' if sc.get('kind') == 'routine' else 'H'
     marks = '/'.join(str(sc.get(f, 0)) for f in ('people', 'emotion', 'view', 'detail', 'brief_match'))
     desc = '' if kind == 'R' else sc.get('desc', '')[:DESC_MAX]
-    return (f'{cid} {key} {_fmt(cand["t"])} {_fmt(sc["in"])}-{_fmt(sc["out"])} r{_fmt(rank(sc))} {kind} {marks} '
+    line = (f'{cid} {key} {_fmt(cand["t"])} {_fmt(sc["in"])}-{_fmt(sc["out"])} r{_fmt(rank(sc))} {kind} {marks} '
             f'{sc.get("quality")} {",".join(sc.get("must_find") or []) or "-"} | {sc.get("process") or "-"} | {desc}')
+    if said and kind == 'H':
+        line += f' | said: {said[:defaults()["speech"]["digest_said_chars"]]}'
+    return line
 
 
-def digest_text(brief: dict, probe: dict, moments: dict) -> str:
+def digest_text(brief: dict, probe: dict, moments: dict, said: dict[str, str] | None = None) -> str:
     btype = brief.get('type', 'trip')
     tcfg = defaults()['types'][btype]
     target = brief.get('target_min') or tcfg['target_min']
@@ -325,15 +351,19 @@ def digest_text(brief: dict, probe: dict, moments: dict) -> str:
         lines.append(f'{g.get("id")} {flag}pick {g["pick"]} {keys.get(cands[g["pick"]]["file"], "?")} '
                      f'in {_fmt(pick["in"])} clip_s {_fmt(g["clip_s"])} · {len(g["members"])} members · {g["process"]}')
     lines += ['', '## Candidates by rank: id clip-key t in-out rank H|R people/emotion/view/detail/brief_match '
-                  'quality must_find | process | desc (highlights only)', '']
-    lines += [_candidate_line(cid, cands[cid], scores[cid], keys.get(cands[cid]['file'], '?')) for cid in scored]
+                  'quality must_find | process | desc (highlights only) | said: camera speech (highlights, when any)', '']
+    lines += [_candidate_line(cid, cands[cid], scores[cid], keys.get(cands[cid]['file'], '?'), (said or {}).get(cid))
+              for cid in scored]
     return '\n'.join(lines) + '\n'
 
 
 def digest_project(root: Path) -> Path:
     root = Path(root)
-    text = digest_text(read_json(root / 'brief.json'), read_json(root / 'probe.json'),
-                       read_json(root / 'moments.json'))
+    moments = read_json(root / 'moments.json')
+    known = {c['id'] for c in moments['candidates']}
+    scored = [cid for cid in moments.get('scores', {}) if cid in known]
+    text = digest_text(read_json(root / 'brief.json'), read_json(root / 'probe.json'), moments,
+                       said_map(root, moments, scored))
     path = cache_dir(root) / 'digest.txt'
     path.write_text(text)
     return path
@@ -379,6 +409,148 @@ def pick_project(root: Path, gid: str, cid: str | None) -> dict:
     return group
 
 
+def _inside(segments: list[dict], t: float) -> dict | None:
+    return next((g for g in segments if g['start'] < t < g['end']), None)
+
+
+def _overlap(silences: list[list[float]], lo: float, hi: float) -> list[float] | None:
+    return next((s for s in silences if s[0] < hi and s[1] > lo), None)
+
+
+def _r(t: float) -> float:
+    return round(t, 3)
+
+
+def _snap_edges(n: int, clip: dict, transcript: dict, duration: float, window: float, pad: float,
+                check_only: bool, notes: list[str]) -> tuple[float, float]:
+    segments, silences = transcript.get('segments', []), transcript.get('silences', [])
+    start = float(clip['start'])
+    end = start + float(clip['duration'])
+    new_start, new_end = start, end
+    seg = _inside(segments, start)
+    if seg:
+        a = seg['start']
+        if check_only:
+            notes.append(f'#{n} start {_r(start)} inside speech')
+        elif start - a > window:
+            notes.append(f'#{n} start {_r(start)} inside speech, no pause within {window:g} s')
+        else:
+            floor = max([g['end'] for g in segments if g['end'] <= a] + [0.0])
+            sil = _overlap(silences, a - pad, a)
+            new_start = max(max(sil[0], a - pad) if sil else a - pad, floor)
+            notes.append(f'#{n} start {_r(start)} \u2192 {_r(new_start)} (mid-speech)')
+    seg = _inside(segments, end)
+    if seg:
+        b = seg['end']
+        if check_only:
+            notes.append(f'#{n} end {_r(end)} inside speech')
+        elif b - end > window:
+            notes.append(f'#{n} end {_r(end)} inside speech, no pause within {window:g} s')
+        else:
+            ceiling = min([g['start'] for g in segments if g['start'] >= b] + [duration])
+            sil = _overlap(silences, b, b + pad)
+            new_end = min(min(sil[1], b + pad) if sil else b + pad, ceiling)
+            notes.append(f'#{n} end {_r(end)} \u2192 {_r(new_end)} (mid-speech)')
+    return new_start, new_end
+
+
+def _net_move(notes: list[str], n: int, edge: str, origin: float, final: float, reason: str) -> None:
+    prefix = f'#{n} {edge} '
+    notes[:] = [x for x in notes if not (x.startswith(prefix) and '\u2192' in x)]
+    if final != origin:
+        notes.append(f'{prefix}{_r(origin)} \u2192 {_r(final)} ({reason})')
+
+
+def _unoverlap(clips: list[dict], edges: list[list[float]], notes: list[str]) -> None:
+    for i in range(1, len(clips)):
+        if clips[i - 1]['file'] != clips[i]['file']:
+            continue
+        for x, y in ((i - 1, i), (i, i - 1)):
+            x_end = float(clips[x]['start']) + float(clips[x]['duration'])
+            if x_end > float(clips[y]['start']):
+                continue
+            y_start = float(clips[y]['start'])
+            if edges[y][0] < edges[x][1] and edges[y][0] != y_start:
+                moved = min(max(edges[y][0], edges[x][1]), y_start)
+                _net_move(notes, y + 1, 'start', y_start, moved, f'clamped to #{x + 1} end')
+                edges[y][0] = moved
+            if edges[x][1] > edges[y][0] and edges[x][1] != x_end:
+                _net_move(notes, x + 1, 'end', x_end, edges[y][0], f'clamped to #{y + 1} start')
+                edges[x][1] = edges[y][0]
+
+
+def _skip_mute(clips: list[dict], edges: list[list[float]], mutes: dict[str, tuple[float, float]],
+               pad: float, check_only: bool, notes: list[str]) -> None:
+    for i, clip in enumerate(clips):
+        gap = mutes.get(clip['file'])
+        start, end = edges[i]
+        if not gap or not (start < gap[1] and end > gap[0]):
+            continue
+        n = i + 1
+        if check_only:
+            notes.append(f'#{n} start {_r(start)} plays mic switch-on mute')
+            continue
+        new_start = gap[1] + pad
+        if end - new_start <= 0:
+            notes.append(f'#{n} inside mic switch-on mute, not moved')
+            continue
+        edges[i][0] = new_start
+        notes.append(f'#{n} start {_r(start)} \u2192 {_r(new_start)} (mic switch-on mute)')
+
+
+def snap_clips(clips: list[dict], transcripts: dict[str, dict], durations: dict[str, float],
+               window: float, pad: float, check_only: bool = False,
+               mutes: dict[str, tuple[float, float]] | None = None,
+               mute_pad: float = 0.1) -> tuple[list[dict], list[str]]:
+    notes: list[str] = []
+    edges = []
+    for n, clip in enumerate(clips, 1):
+        start = float(clip['start'])
+        transcript = transcripts.get(clip['file'])
+        if transcript:
+            edges.append(list(_snap_edges(n, clip, transcript, durations.get(clip['file'], math.inf),
+                                          window, pad, check_only, notes)))
+        else:
+            edges.append([start, start + float(clip['duration'])])
+    _unoverlap(clips, edges, notes)
+    if mutes:
+        _skip_mute(clips, edges, mutes, mute_pad, check_only, notes)
+    out = []
+    for clip, (new_start, new_end) in zip(clips, edges):
+        row = dict(clip)
+        start = float(clip['start'])
+        if (new_start, new_end) != (start, start + float(clip['duration'])):
+            row['start'] = _r(new_start)
+            row['duration'] = _r(new_end - new_start)
+        out.append(row)
+    return out, notes
+
+
+def mic_mute(root: Path, file: str) -> tuple[float, float] | None:
+    cfg = defaults()['mute']
+    af = f'silencedetect=noise={cfg["noise_db"]}dB:d={cfg["min_s"]}'
+    res = run(['ffmpeg', '-hide_banner', '-nostats', '-t', str(cfg['scan_s']), '-i', str(root / file),
+               '-vn', '-af', af, '-f', 'null', '-'], check=False)
+    start = None
+    for line in res.stderr.splitlines():
+        if m := re.search(r'silence_start: (-?[\d.]+)', line):
+            start = max(0.0, float(m[1]))
+        elif (m := re.search(r'silence_end: (-?[\d.]+)', line)) and start is not None:
+            return (_r(start), _r(float(m[1]))) if start <= cfg['latest_s'] else None
+    return None
+
+
+def snap_project(root: Path, clips: list[dict], check_only: bool = False) -> tuple[list[dict], list[str]]:
+    cfg = defaults()['speech']
+    files = {c['file'] for c in clips}
+    transcripts = {f: t for f in files if (t := speech.load_transcript(root, f))}
+    durations = {c['file']: c['duration'] for c in read_json(root / 'probe.json')['clips']}
+    mute_cfg = defaults()['mute']
+    mutes = {f: gap for f in files if (gap := mic_mute(root, f))}
+    return snap_clips(clips, transcripts, durations, cfg['snap_window_s'], cfg['snap_pad_s'], check_only,
+                      mutes, mute_cfg['pad_s'])
+
+
 def _read_source(src: str) -> str:
     return sys.stdin.read() if src == '-' else Path(src).expanduser().read_text()
 
@@ -396,6 +568,9 @@ def main() -> None:
     pd.add_argument('--batch', type=int, default=40)
     uc = sub.add_parser('uncovered', help='list scored highlights no clip covers, by rank')
     uc.add_argument('clips', help='clips.json array file, or - for stdin')
+    sn = sub.add_parser('snap', help='move clip edges that cut speech outward to a pause; notes to stderr')
+    sn.add_argument('clips', help='clips.json array file, or - for stdin')
+    sn.add_argument('--check', action='store_true', help='only report edges inside speech; change nothing')
     sub.add_parser('digest', help='write the compact clip-editor digest to the cache; print its path')
     pk = sub.add_parser('pick', help='swap a group pick to another member, or drop the group')
     pk.add_argument('group', help='group id as in the shortlist, e.g. g3')
@@ -426,6 +601,16 @@ def main() -> None:
         for r in rows:
             print(f'- {r["id"]} · rank {_fmt(r["rank"])} · {",".join(r["must_find"]) or "-"} · {r["file"]} · '
                   f'{_fmt(r["in"])}–{_fmt(r["out"])} · {r["desc"]} · {r["thumb"]}')
+        return
+    if args.command == 'snap':
+        try:
+            rows, notes = snap_project(root, json.loads(_read_source(args.clips)), args.check)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            print(f'ERROR: {exc}', file=sys.stderr)
+            sys.exit(1)
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        for note in notes:
+            print(note, file=sys.stderr)
         return
     if args.command == 'digest':
         print(digest_project(root))

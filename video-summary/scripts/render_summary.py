@@ -8,8 +8,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from common import DRAFT_NAME, LUT_PATH, defaults, output_path, read_json, run  # noqa: E402
+from common import DRAFT_NAME, LUT_PATH, defaults, manifest_path, output_path, read_json, run  # noqa: E402
 from filters import audio_filter, fps_expr, music_args, scale_frame, video_filter  # noqa: E402
+from probe import _ffprobe  # noqa: E402
 from verify import validate  # noqa: E402
 
 FONTS = ('/System/Library/Fonts/SFNS.ttf', '/System/Library/Fonts/Helvetica.ttc',
@@ -43,10 +44,10 @@ def _validate(config: dict, clips: list[dict], probe: dict) -> None:
 
 
 def _clip_cmd(clip: dict, src: dict, source: Path, dest: Path, vf: str, quality: int, audio_br: str,
-              fps: str) -> list[str]:
+              fps: str, fade_s: float) -> list[str]:
     start, dur = f'{clip["start"]:.3f}', f'{clip["duration"]:.3f}'
     cmd = ['ffmpeg', '-hide_banner', '-v', 'error', '-y', '-ss', start, '-i', str(source)]
-    af = audio_filter(src)
+    af = audio_filter(src, clip['duration'], fade_s)
     if af is None:
         cmd += ['-f', 'lavfi', '-t', dur, '-i', 'anullsrc=r=48000:cl=mono']
     cmd += ['-t', dur, '-map', '0:v:0', '-map', '0:a:0' if af else '1:a:0', '-vf', vf]
@@ -56,18 +57,32 @@ def _clip_cmd(clip: dict, src: dict, source: Path, dest: Path, vf: str, quality:
                   '-c:a', 'aac', '-b:a', audio_br, '-ar', '48000', '-ac', '1', '-r', fps, str(dest)]
 
 
+def _container_s(path: Path) -> float:
+    return round(float(_ffprobe(path, 'v:0')['format']['duration']), 3)
+
+
 def _path(value) -> Path:
     return Path(str(value)).expanduser().resolve()
 
 
 def render(config: dict, clips: list[dict], probe: dict, draft: bool = False,
-           overwrite: bool = False) -> Path:
+           overwrite: bool = False, clip_range: tuple[int, int] | None = None) -> Path:
+    if clip_range is not None and not draft:
+        raise ValueError('--clips needs --draft')
     _validate(config, clips, probe)
+    first = 0
+    selected = clips
+    if clip_range is not None:
+        lo, hi = clip_range
+        if not 1 <= lo <= hi <= len(clips):
+            raise ValueError(f'--clips {lo}-{hi} is outside 1-{len(clips)}')
+        first, selected = lo - 1, clips[lo - 1:hi]
     sources = {c['file']: c for c in probe['clips']}
     rcfg = defaults()['render']
     out = _path(config['out'])
     frame = dict(config['frame'])
     audio_br = config.get('audio_br', rcfg['audio_br'])
+    fade_s = config.get('join_fade_s', rcfg['join_fade_s'])
     if draft:
         frame = scale_frame(frame, config.get('draft_long_side', rcfg['draft_long_side']))
         quality, pix_fmt = config.get('draft_quality', rcfg['draft_quality']), 'yuv420p'
@@ -86,17 +101,19 @@ def render(config: dict, clips: list[dict], probe: dict, draft: bool = False,
     src_root = _path(config['src'])
 
     processed, manifest = [], []
-    for i, clip in enumerate(clips):
+    for n, clip in enumerate(selected):
+        i = first + n
         src = sources[clip['file']]
         start, dur = float(clip['start']), float(clip['duration'])
-        print(f'[{i + 1}/{len(clips)}] {clip["file"]} [{start:.1f}→{start + dur:.1f}] "{clip["label"]}"',
+        print(f'[{n + 1}/{len(selected)}] {clip["file"]} [{start:.1f}→{start + dur:.1f}] "{clip["label"]}"',
               flush=True)
         dest = work / f'clip_{i:03d}.mp4'
         vf = video_filter(clip, src, frame, lut, font, pix_fmt)
-        _ffmpeg(_clip_cmd(clip, src, src_root / clip['file'], dest, vf, quality, audio_br, fps),
+        _ffmpeg(_clip_cmd(clip, src, src_root / clip['file'], dest, vf, quality, audio_br, fps, fade_s),
                 f'clip {i + 1} ({clip["file"]})')
         processed.append(dest)
-        manifest.append({'index': i, 'file': clip['file'], 'lut': bool(clip['lut']), 'duration': dur})
+        manifest.append({'index': i, 'file': clip['file'], 'lut': bool(clip['lut']), 'start': start,
+                         'duration': dur, 'out_duration': _container_s(dest), 'label': clip['label']})
 
     concat = work / 'concat.txt'
     concat.write_text(''.join(concat_entry(p.resolve()) for p in processed))
@@ -111,10 +128,22 @@ def render(config: dict, clips: list[dict], probe: dict, draft: bool = False,
     _ffmpeg(cmd, 'concat')
     shutil.move(str(merged), str(target))
 
-    (tmp_root / 'render-manifest.json').write_text(
-        json.dumps({'clips': manifest, 'draft': draft, 'out': str(target)}, indent=2, ensure_ascii=False) + '\n')
+    manifest_file = manifest_path(config, draft)
+    manifest_file.parent.mkdir(parents=True, exist_ok=True)
+    manifest_file.write_text(json.dumps(
+        {'clips': manifest, 'draft': draft, 'range': list(clip_range) if clip_range else None,
+         'out': str(target)}, indent=2, ensure_ascii=False) + '\n')
     print(f'Done!  {target}', flush=True)
     return target
+
+
+def parse_clip_range(text: str) -> tuple[int, int]:
+    lo, sep, hi = text.partition('-')
+    try:
+        bounds = (int(lo), int(hi) if sep else int(lo))
+    except ValueError:
+        raise ValueError(f'--clips must be N or LO-HI, got {text!r}') from None
+    return bounds
 
 
 def main() -> None:
@@ -122,13 +151,15 @@ def main() -> None:
     parser.add_argument('project')
     parser.add_argument('--draft', action='store_true', help=f'fast low-res preview to {DRAFT_NAME}')
     parser.add_argument('--overwrite', action='store_true', help='replace an existing final output')
+    parser.add_argument('--clips', help='with --draft: render only clips LO-HI (1-based, inclusive) or N')
     args = parser.parse_args()
     project = Path(args.project).expanduser()
     try:
         config, clips, probe = (read_json(project / n) for n in ('config.json', 'clips.json', 'probe.json'))
         if isinstance(config, dict) and 'src' in config and _path(config['src']) != project.resolve():
             raise ValueError(f'config.src {config["src"]} is not the project folder {project.resolve()}')
-        render(config, clips, probe, draft=args.draft, overwrite=args.overwrite)
+        clip_range = parse_clip_range(args.clips) if args.clips else None
+        render(config, clips, probe, draft=args.draft, overwrite=args.overwrite, clip_range=clip_range)
     except FileExistsError as exc:
         raise SystemExit(f'exists, use --overwrite: {exc}')
     except (OSError, ValueError, RuntimeError) as exc:

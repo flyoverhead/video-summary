@@ -77,8 +77,24 @@ def test_video_filter_fit_when_aspect_differs():
 
 
 def test_audio_filter_mono_left():
-    assert filters.audio_filter(_src(320, 320, ch=2)).startswith('pan=mono|c0=c0')
-    assert filters.audio_filter(_src(320, 320, ch=0)) is None
+    assert filters.audio_filter(_src(320, 320, ch=2), 1.5, 0.05).startswith('pan=mono|c0=c0')
+    assert filters.audio_filter(_src(320, 320, ch=0), 1.5, 0.05) is None
+
+
+def test_audio_filter_has_micro_fades():
+    af = filters.audio_filter(_src(320, 320), 1.5, 0.05)
+    assert 'afade=t=in:d=0.050' in af
+    assert 'afade=t=out:st=1.450:d=0.050' in af
+    assert 'st=0.000' in filters.audio_filter(_src(320, 320), 0.02, 0.05)
+
+
+def test_render_join_has_no_click(render_project, tmp_path, square_clip):
+    sources = [(square_clip, 'a.mp4', 'A', False), (square_clip, 'b.mp4', 'B', False)]
+    config, clips, probe_data = render_project(tmp_path / 'p', sources, tmp_path / 'tmp')
+    out = render_summary.render(config, clips, probe_data)
+    steady = _rms(out, 0.5, 0.5)
+    at_join = _rms(out, 1.495, 0.01)
+    assert at_join < steady - 6
 
 
 def test_render_mixed_shapes_square_out(render_project, tmp_path, square_clip, vertical_clip, wide_clip):
@@ -130,7 +146,7 @@ def test_render_draft_path(render_project, tmp_path, square_clip, vertical_clip)
     assert out.read_bytes() == b'final'
     video = _stream(_streams(draft), 'video')
     assert (video['width'], video['height']) == (160, 160)
-    assert read_json(Path(config['tmp']) / 'render-manifest.json')['draft'] is True
+    assert read_json(Path(config['tmp']) / 'render-manifest.draft.json')['draft'] is True
 
 
 def test_render_manifest_records_lut(rendered_project):
@@ -275,7 +291,7 @@ def test_render_expands_home_in_config_paths(render_project, tmp_path, square_cl
     out = render_summary.render(config, clips, probe_data, draft=True)
     assert out == home / 'trip' / 'SUMMARY_VIDEO.draft.mp4'
     assert out.exists()
-    assert (home / 'cache' / 'render' / 'render-manifest.json').exists()
+    assert (home / 'cache' / 'render' / 'render-manifest.draft.json').exists()
     assert list(work.iterdir()) == []
 
 
@@ -296,3 +312,67 @@ def test_render_refuses_missing_music_file(render_project, tmp_path, square_clip
                                                music={'file': str(tmp_path / 'nope.mp3'), 'mode': 'duck'})
     _assert_refused(config, clips, probe_data, 'music file not found')
     assert not (tmp_path / 'tmp').exists()
+
+
+def test_manifest_final_and_draft_separate(render_project, tmp_path, square_clip):
+    config, clips, probe_data = render_project(tmp_path / 'p', [(square_clip, 'a.mp4', 'A', False)],
+                                               tmp_path / 'tmp')
+    render_summary.render(config, clips, probe_data)
+    render_summary.render(config, clips, probe_data, draft=True)
+    tmp = Path(config['tmp'])
+    assert read_json(tmp / 'render-manifest.final.json')['draft'] is False
+    assert read_json(tmp / 'render-manifest.draft.json')['draft'] is True
+    assert not (tmp / 'render-manifest.json').exists()
+
+
+def test_manifest_has_start_and_label(rendered_project):
+    manifest = read_json(rendered_project['manifest'])
+    assert [c['start'] for c in manifest['clips']] == [0.5] * 3
+    assert [c['label'] for c in manifest['clips']] == ['Harbour', 'Peak', 'Tram']
+    assert manifest['range'] is None
+
+
+def test_manifest_records_measured_clip_lengths(rendered_project):
+    manifest = read_json(rendered_project['manifest'])
+    total = float(_streams(rendered_project['out'])['format']['duration'])
+    lengths = [c['out_duration'] for c in manifest['clips']]
+    assert all(abs(length - c['duration']) < 0.2 for length, c in zip(lengths, manifest['clips']))
+    assert abs(sum(lengths) - total) < 0.05
+
+
+def test_pilot_renders_range_only(render_project, tmp_path, square_clip, vertical_clip, silent_clip):
+    sources = [(square_clip, 'a.mp4', 'A', False), (vertical_clip, 'b.mp4', 'B', True),
+               (silent_clip, 'c.mp4', 'C', False)]
+    config, clips, probe_data = render_project(tmp_path / 'p', sources, tmp_path / 'tmp')
+    out = render_summary.render(config, clips, probe_data, draft=True, clip_range=(2, 3))
+    assert abs(float(_streams(out)['format']['duration']) - 3.0) <= 0.3
+    manifest = read_json(Path(config['tmp']) / 'render-manifest.draft.json')
+    assert manifest['range'] == [2, 3]
+    assert [c['index'] for c in manifest['clips']] == [1, 2]
+    assert [c['file'] for c in manifest['clips']] == ['b.mp4', 'c.mp4']
+
+
+def test_pilot_refused_without_draft(render_project, tmp_path, square_clip):
+    config, clips, probe_data = render_project(tmp_path / 'p', [(square_clip, 'a.mp4', 'A', False)],
+                                               tmp_path / 'tmp')
+    with pytest.raises(ValueError, match='--clips needs --draft'):
+        render_summary.render(config, clips, probe_data, clip_range=(1, 1))
+    assert not Path(config['out']).exists()
+
+
+@pytest.mark.parametrize('bad', [(0, 1), (2, 1), (1, 2)])
+def test_pilot_range_out_of_bounds(render_project, tmp_path, square_clip, bad):
+    config, clips, probe_data = render_project(tmp_path / 'p', [(square_clip, 'a.mp4', 'A', False)],
+                                               tmp_path / 'tmp')
+    with pytest.raises(ValueError, match='outside'):
+        render_summary.render(config, clips, probe_data, draft=True, clip_range=bad)
+
+
+@pytest.mark.parametrize('text, expected', [('2-3', (2, 3)), ('5', (5, 5))])
+def test_parse_clip_range(text, expected):
+    assert render_summary.parse_clip_range(text) == expected
+
+
+def test_parse_clip_range_invalid():
+    with pytest.raises(ValueError, match='LO-HI'):
+        render_summary.parse_clip_range('a-b')

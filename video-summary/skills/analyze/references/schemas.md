@@ -1,7 +1,7 @@
 # Project file schemas
 
 All files live in the project root (the footage folder the user named) except
-`render-manifest.json` and the thumbnails, which live under `~/.cache/video-summary/<slug>/`.
+`render-manifest.draft.json`, `render-manifest.final.json` and the thumbnails, which live under `~/.cache/video-summary/<slug>/`.
 Paths in `file` fields are relative to the project root.
 
 ## Contents
@@ -12,7 +12,7 @@ Paths in `file` fields are relative to the project root.
 - [moments.json](#momentsjson)
 - [clips.json](#clipsjson)
 - [config.json](#configjson)
-- [render-manifest.json](#render-manifestjson)
+- [render-manifest.draft.json / render-manifest.final.json](#render-manifest-files)
 
 ## Who writes what
 
@@ -73,7 +73,11 @@ Nothing else is ever written into the project folder, and source clips are never
  "lut": {"22.08/DJI_0001_D.MP4": true}}
 ```
 
-- `source`: `scene` | `loud` | `baseline`.
+- `source`: `scene` | `loud` | `speech` | `baseline`.
+- `speech_seen`: `true` on candidates created while transcripts exist; `sample.py --add-speech` sets it on
+  every candidate it processes and deletes the score of a scored candidate that lacks it and has
+  speech in its `said` window, only for a project sampled before transcripts existed (no `speech` candidate,
+  no `speech_seen`), so `moments.py pending` hands it out again with `said`.
 - Score integers are 0–5; `quality` `good` | `fair` | `poor`; `kind` `highlight` | `routine`;
   `process` a string for routine, `null` for highlight; `0 <= in < out`; `must_find` ids must
   exist in `brief.json`. `moments.py merge` rejects the whole batch on any violation and names
@@ -89,10 +93,18 @@ Nothing else is ever written into the project folder, and source clips are never
   and is re-applied by every `group`; an override that matches no group is kept and reported on
   stderr.
 - `moments.py pending` writes `<cache>/scores/input-<first id>.json` per batch
-  (`{"candidates": [{"id", "file", "t", "thumb", "duration"}], "process_labels": [str]}`), the
+  (`{"candidates": [{"id", "file", "t", "thumb", "duration", "said"?}], "process_labels": [str]}`;
+  `said` is the camera speech from `said_before_s` before to `said_after_s` after `t`, at most
+  `said_max_chars`, present only when there is any), the
   frame-analyst's only input besides `brief.json`; its scores go to
   `<cache>/scores/batch-<first id>.json` and are merged from there. `pending` deletes a stale
   scores file before printing its path; `sample.py --overwrite` clears `<cache>/scores/`.
+- `speech.py transcribe` writes one transcript per clip to
+  `<cache>/speech/<sha1(file)[:16]>.json`:
+  `{"file", "language", "segments": [{"start", "end", "text"}], "silences": [[start, end]], "error"}`.
+  `sample.py` and `moments.py pending|digest` read it; nothing is written to the project folder.
+- In `digest.txt` a highlight line ends with ` | said: <first digest_said_chars chars>` when the
+  camera heard speech near it.
 - The cache folder is `~/.cache/video-summary/<path under ~/Movies/camera with / as ->`, or
   `<folder name>-<8-hex hash of the resolved path>` for a project elsewhere.
 - `moments.py digest` writes `<cache>/digest.txt`, one line per clip, must-find, group and scored
@@ -134,11 +146,17 @@ No `time` field and no timestamps in labels; labels show place or moment only.
 - `music`: `null` or `{"file": "/abs/song.mp3", "mode": "duck" | "replace", "duck_db": -18}`; `file` may start with `~`
   and must exist, or validation refuses the render.
 
-## render-manifest.json
+## render-manifest files
 
-Written by `render_summary.py` into `config.tmp`, read by `verify.py`:
+`render-manifest.draft.json` and `render-manifest.final.json`: one per output, written by
+`render_summary.py` into `config.tmp`, read by `verify.py`. `index` is the 0-based position in
+the full `clips.json`; `range` is `[lo, hi]` (1-based, inclusive) for a pilot draft, else `null`.
+`out_duration` is the rendered intermediate's container length (the longest stream, AAC padding
+included), which is what the concat advances by; `verify.py` places joins and `--locate` by it,
+and falls back to the planned `duration` for manifests written before it existed.
 
 ```json
-{"clips": [{"index": 0, "file": "22.08/DJI_0001_D.MP4", "lut": true, "duration": 8.0}],
- "draft": false, "out": "/abs/folder/SUMMARY_VIDEO.mp4"}
+{"clips": [{"index": 0, "file": "22.08/DJI_0001_D.MP4", "lut": true, "start": 12.0,
+            "duration": 8.0, "out_duration": 8.021, "label": "Harbour"}],
+ "draft": false, "range": null, "out": "/abs/folder/SUMMARY_VIDEO.mp4"}
 ```

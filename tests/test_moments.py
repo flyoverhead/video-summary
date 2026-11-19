@@ -154,7 +154,8 @@ def _merge_project(tmp_path):
 
 
 def moments_cli(*args, stdin=None, home=None):
-    env = {**os.environ, 'HOME': str(home)} if home else None
+    env = ({**os.environ, 'HOME': str(home),
+            'VIDEO_SUMMARY_CACHE_DIR': str(home / '.cache' / 'video-summary')} if home else None)
     return subprocess.run([sys.executable, str(MOMENTS_SCRIPT), *map(str, args)], input=stdin,
                           capture_output=True, text=True, env=env)
 
@@ -481,3 +482,286 @@ def test_pending_removes_stale_scores_file(tmp_path):
     scores_path.write_text('{"c2": "stale"}')
     again = pending_batches(tmp_path, 40)[0][0]
     assert again == scores_path and not scores_path.exists()
+
+
+def _speech_project(root):
+    import speech
+    brief = {'type': 'trip', 'must_find': []}
+    moments = {'candidates': [cand('c1', 'a/1.MP4', 1.0), cand('c2', 'a/1.MP4', 40.0)], 'scores': {}}
+    write_output(root, 'brief.json', brief)
+    write_output(root, 'probe.json', PROBE)
+    write_output(root, 'moments.json', moments)
+    segments = [{'start': 0.5, 'end': 1.5, 'text': 'look at this'}]
+    speech._write_transcript(root, 'a/1.MP4', 'en', segments, [], None)
+
+
+def test_batch_input_includes_said(tmp_path):
+    from moments import batch_input, pending_batches
+    _speech_project(tmp_path)
+    _, input_path, _ = pending_batches(tmp_path, 40)[0]
+    rows = {r['id']: r for r in read_json(input_path)['candidates']}
+    assert rows['c1']['said'] == 'look at this'
+    assert 'said' not in rows['c2']
+    moments = read_json(tmp_path / 'moments.json')
+    assert 'said' not in batch_input(moments, PROBE, ['c1'])['candidates'][0]
+    assert batch_input(moments, PROBE, ['c1'], {'c1': 'hi'})['candidates'][0]['said'] == 'hi'
+
+
+def test_digest_line_has_said_truncated():
+    from moments import digest_text
+    brief, moments = _full()
+    said = 'x' * 100
+    text = digest_text(brief, PROBE, moments, {'c2': said})
+    line = next(line for line in text.splitlines() if line.startswith('c2 '))
+    assert line.endswith(' | said: ' + 'x' * 60)
+    plain = next(line for line in digest_text(brief, PROBE, moments).splitlines() if line.startswith('c2 '))
+    assert 'said:' not in plain
+
+
+def test_digest_project_builds_said(tmp_path):
+    from moments import digest_project
+    _speech_project(tmp_path)
+    moments = read_json(tmp_path / 'moments.json')
+    moments['scores'] = {'c1': score(desc='kid'), 'c2': score(desc='road')}
+    write_output(tmp_path, 'moments.json', moments, overwrite=True)
+    text = digest_project(tmp_path).read_text()
+    assert re.search(r'^c1 .*\| kid \| said: look at this$', text, re.M)
+    assert not re.search(r'^c2 .*said:', text, re.M)
+
+
+def _snap(clips, segments, silences=(), file='a/1.MP4', duration=10.0, check_only=False):
+    from moments import snap_clips
+    transcripts = {file: {'segments': [{'start': a, 'end': b, 'text': 'x'} for a, b in segments],
+                          'silences': [list(s) for s in silences]}}
+    return snap_clips(clips, transcripts, {file: duration}, 1.5, 0.2, check_only)
+
+
+def _clip(start, duration, file='a/1.MP4'):
+    return {'file': file, 'start': start, 'duration': duration, 'label': 'x', 'lut': False}
+
+
+def test_snap_extends_start_to_segment_start():
+    rows, notes = _snap([_clip(30.0, 5.0)], [(28.8, 33.0)], duration=60)
+    assert rows[0]['start'] == 28.6
+    assert rows[0]['duration'] == 6.4
+    assert '30.0 \u2192 28.6' in notes[0]
+    assert notes[0].startswith('#1 start')
+
+
+def test_snap_uses_silence_within_pad():
+    rows, _ = _snap([_clip(30.0, 5.0)], [(28.8, 33.0)], [(28.7, 28.75)], duration=60)
+    assert rows[0]['start'] == 28.7
+
+
+def test_snap_leaves_edge_beyond_window_and_notes_it():
+    rows, notes = _snap([_clip(31.0, 5.0)], [(28.8, 33.0)], duration=60)
+    assert rows[0]['start'] == 31.0
+    assert rows[0]['duration'] == 5.0
+    assert 'no pause within 1.5 s' in notes[0]
+
+
+def test_snap_end_extends_outward():
+    rows, notes = _snap([_clip(36.0, 4.5)], [(38.0, 41.0)], duration=60)
+    assert rows[0]['start'] == 36.0
+    assert rows[0]['duration'] == 5.2
+    assert '40.5 \u2192 41.2' in notes[0]
+
+
+def test_snap_clamps_to_file_bounds():
+    rows, _ = _snap([_clip(0.5, 3.0)], [(0.0, 1.0)])
+    assert rows[0]['start'] == 0.0
+    rows, _ = _snap([_clip(5.0, 4.8)], [(9.5, 10.2)])
+    assert rows[0]['start'] + rows[0]['duration'] == 10.0
+
+
+def test_snap_edge_on_segment_boundary_is_left():
+    rows, notes = _snap([_clip(28.8, 4.2)], [(28.8, 33.0)], duration=60)
+    assert rows[0] == _clip(28.8, 4.2)
+    assert notes == []
+
+
+def test_snap_check_changes_nothing():
+    clips = [_clip(30.0, 5.0)]
+    rows, notes = _snap(clips, [(28.8, 33.0)], duration=60, check_only=True)
+    assert rows == clips
+    assert notes == ['#1 start 30.0 inside speech']
+
+
+def test_snap_no_transcript_passthrough():
+    from moments import snap_clips
+    clips = [_clip(30.0, 5.0)]
+    rows, notes = snap_clips(clips, {}, {'a/1.MP4': 60}, 1.5, 0.2)
+    assert rows == clips
+    assert notes == []
+
+
+def test_cli_snap(tmp_path, monkeypatch):
+    import common
+    import speech
+    home = tmp_path / 'home'
+    monkeypatch.setattr(common, 'CACHE_ROOT', home / '.cache' / 'video-summary')
+    write_output(tmp_path, 'probe.json', PROBE)
+    speech._write_transcript(tmp_path, 'a/1.MP4', 'en', [{'start': 28.8, 'end': 33.0, 'text': 'x'}], [], None)
+    clips = [_clip(30.0, 5.0)]
+    proc = moments_cli(tmp_path, 'snap', '-', stdin=json.dumps(clips), home=home)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout)[0]['start'] == 28.6
+    assert '#1 start 30.0 \u2192 28.6 (mid-speech)' in proc.stderr
+    checked = moments_cli(tmp_path, 'snap', '-', '--check', stdin=json.dumps(clips), home=home)
+    assert json.loads(checked.stdout) == clips
+    assert '#1 start 30.0 inside speech' in checked.stderr
+    assert moments_cli(tmp_path, 'snap', '-', stdin='{bad', home=home).returncode == 1
+
+
+def _end(row):
+    return round(row['start'] + row['duration'], 3)
+
+
+def test_snap_same_file_neighbours_do_not_overlap():
+    rows, notes = _snap([_clip(10.0, 5.0), _clip(17.5, 5.0)], [(14.0, 16.5), (16.6, 19.0)], duration=60)
+    assert _end(rows[0]) == 16.6
+    assert rows[1]['start'] == 16.6
+    assert _end(rows[1]) == 22.5
+    assert '#2 start 17.5 → 16.6 (clamped to #1 end)' in notes
+    assert not any('16.5' in x for x in notes)
+
+
+def test_snap_neighbours_snapping_into_one_utterance_touch():
+    rows, notes = _snap([_clip(10.0, 5.0), _clip(15.1, 4.9)], [(14.0, 16.0)], duration=60)
+    assert _end(rows[0]) == 15.1
+    assert rows[1]['start'] == 15.1
+    assert _end(rows[1]) == 20.0
+    assert '#1 end 15.0 → 15.1 (clamped to #2 start)' in notes
+    assert notes == ['#1 end 15.0 → 15.1 (clamped to #2 start)']
+
+
+def test_snap_moved_end_clamped_to_unmoved_neighbour_start():
+    rows, notes = _snap([_clip(10.0, 5.0), _clip(15.6, 3.0)], [(14.0, 15.5)], duration=60)
+    assert _end(rows[0]) == 15.6
+    assert rows[1] == _clip(15.6, 3.0)
+    assert '#1 end 15.0 → 15.6 (clamped to #2 start)' in notes
+    assert not any('15.7' in x for x in notes)
+
+
+def test_snap_neighbours_in_other_files_untouched():
+    clips = [_clip(10.0, 5.0), _clip(15.1, 4.9, file='b/2.MP4')]
+    rows, _ = _snap(clips, [(14.0, 16.0)], duration=60)
+    assert _end(rows[0]) == 16.2
+    assert rows[1] == clips[1]
+
+
+def test_snap_pad_stops_at_previous_segment_end():
+    rows, notes = _snap([_clip(30.0, 5.0)], [(27.0, 28.7), (28.8, 33.0)], duration=60)
+    assert rows[0]['start'] == 28.7
+    assert '30.0 → 28.7' in notes[0]
+
+
+def test_snap_pad_stops_at_next_segment_start():
+    rows, _ = _snap([_clip(36.0, 4.5)], [(38.0, 41.0), (41.1, 43.0)], duration=60)
+    assert _end(rows[0]) == 41.1
+
+
+def test_snap_end_into_silence():
+    rows, notes = _snap([_clip(36.0, 4.5)], [(38.0, 41.0)], [(41.05, 41.1)], duration=60)
+    assert _end(rows[0]) == 41.1
+    assert '40.5 → 41.1' in notes[0]
+
+
+def test_snap_end_beyond_window_note_is_rounded():
+    rows, notes = _snap([_clip(0.1, 0.2)], [(0.25, 5.0)], duration=60)
+    assert rows[0] == _clip(0.1, 0.2)
+    assert notes == ['#1 end 0.3 inside speech, no pause within 1.5 s']
+
+
+def test_snap_check_reports_end_edge():
+    clips = [_clip(36.0, 4.5)]
+    rows, notes = _snap(clips, [(38.0, 41.0)], duration=60, check_only=True)
+    assert rows == clips
+    assert notes == ['#1 end 40.5 inside speech']
+
+
+def _mute_clip(path, gap_at, gap_s=0.7, video=True):
+    from common import run
+    parts = [('sine=frequency=440:sample_rate=48000', gap_at), ('anullsrc=r=48000:cl=mono', gap_s),
+             ('sine=frequency=440:sample_rate=48000', 2.0)]
+    cmd = ['ffmpeg', '-v', 'error', '-y']
+    for src, d in parts:
+        cmd += ['-f', 'lavfi', '-t', str(d), '-i', src]
+    cmd += ['-filter_complex', '[0][1][2]concat=n=3:v=0:a=1[a]']
+    if video:
+        cmd += ['-f', 'lavfi', '-t', '8', '-i', 'color=c=black:s=64x64:r=10']
+    cmd += ['-map', '[a]', '-c:a', 'aac']
+    if video:
+        cmd += ['-map', '3:v', '-c:v', 'mpeg4']
+    cmd.append(str(path))
+    run(cmd)
+    return path
+
+
+def test_mic_mute_finds_gap(tmp_path):
+    from moments import mic_mute
+    _mute_clip(tmp_path / 'm.mp4', 3.0)
+    gap = mic_mute(tmp_path, 'm.mp4')
+    assert gap is not None
+    assert abs(gap[0] - 3.0) < 0.05 and abs(gap[1] - 3.7) < 0.05
+
+
+def test_mic_mute_ignores_late_gap(tmp_path):
+    from moments import mic_mute
+    _mute_clip(tmp_path / 'late.mp4', 4.0)
+    assert mic_mute(tmp_path, 'late.mp4') is None
+
+
+def test_mic_mute_video_only_file(tmp_path):
+    from common import run
+    from moments import mic_mute
+    run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-t', '3', '-i', 'color=c=black:s=64x64:r=10',
+         '-c:v', 'mpeg4', str(tmp_path / 'v.mp4')])
+    assert mic_mute(tmp_path, 'v.mp4') is None
+
+
+def _snap_mute(clips, check_only=False, mutes=None):
+    from moments import snap_clips
+    return snap_clips(clips, {}, {'a/1.MP4': 60}, 1.5, 0.2, check_only, mutes or {'a/1.MP4': (1.0, 1.7)})
+
+
+def test_snap_skips_mic_mute_keeps_end():
+    rows, notes = _snap_mute([_clip(0.0, 5.0)])
+    assert rows[0]['start'] == 1.8
+    assert _end(rows[0]) == 5.0
+    assert notes == ['#1 start 0.0 → 1.8 (mic switch-on mute)']
+
+
+def test_snap_mute_leaves_clip_after_gap():
+    rows, notes = _snap_mute([_clip(2.0, 3.0)])
+    assert rows[0] == _clip(2.0, 3.0)
+    assert notes == []
+
+
+def test_snap_mute_check_only_notes_and_keeps():
+    clips = [_clip(0.0, 5.0)]
+    rows, notes = _snap_mute(clips, check_only=True)
+    assert rows == clips
+    assert notes == ['#1 start 0.0 plays mic switch-on mute']
+
+
+def test_snap_mute_clip_inside_gap_unchanged():
+    rows, notes = _snap_mute([_clip(1.1, 0.5)])
+    assert rows[0] == _clip(1.1, 0.5)
+    assert notes == ['#1 inside mic switch-on mute, not moved']
+
+
+def test_snap_mute_other_file_untouched():
+    rows, notes = _snap_mute([_clip(0.0, 5.0, file='a/2.MP4')])
+    assert rows[0] == _clip(0.0, 5.0, file='a/2.MP4')
+    assert notes == []
+
+
+def test_unoverlap_double_clamp_keeps_one_note_per_edge():
+    from moments import _unoverlap
+    clips = [_clip(10.0, 5.0), _clip(20.0, 5.0), _clip(16.0, 3.0)]
+    edges = [[10.0, 16.7], [15.0, 25.0], [16.0, 19.0]]
+    notes = []
+    _unoverlap(clips, edges, notes)
+    assert edges[1][0] == 19.0
+    assert [x for x in notes if x.startswith('#2 start ') and '→' in x] == ['#2 start 20.0 → 19.0 (clamped to #3 end)']

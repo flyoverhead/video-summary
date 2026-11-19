@@ -25,6 +25,7 @@ Copy and track:
 - [ ] 1. Resolve the project folder; list existing outputs; ask resume or redo
 - [ ] 2. Fill the inputs table from the prompt; one numbered question for the rest
 - [ ] 3. Write brief.json (project.py write)
+- [ ] 3b. speech.py check (exit 0 before analyze)
 - [ ] 4. video-summary:analyze
 - [ ] 5. video-summary:grade
 - [ ] 6. video-summary:plan
@@ -48,7 +49,8 @@ Found in <folder>: brief.json, probe.json, moments.json (412 candidates, 380 sco
 ```
 
 Resume picks the first stage whose output is missing or incomplete: no `brief.json` → interview;
-no `probe.json` or unscored candidates (`moments.py "<project>" pending` prints any, unless the
+no `probe.json`, `moments.json` scored without speech (`speech.py status "<project>"` exits 1;
+analyze's resume rule asks the user), or unscored candidates (`moments.py "<project>" pending` prints any, unless the
 user already acknowledged them as unscorable) → analyze;
 no `lut` decisions in `moments.json` → grade; no `clips.json` → plan; no `SUMMARY_VIDEO.mp4` →
 render. On resume, Read `brief.json` and carry it forward instead of re-asking.
@@ -57,6 +59,11 @@ Redo of `probe.json` or `moments.json` means `--overwrite` on `probe.py` / `samp
 discards all scores. Say so and get a yes for that specifically.
 
 ## 2. Interview
+
+Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/prefs.py" show` first and tell the user the count
+(`3 saved preferences`, or none). Rules about interview defaults (target length, quality, music,
+tone) replace the defaults in the table below and are stated in the defaults line; the other
+rules are applied later by plan. The user's answers always win over a rule.
 
 Fill this table from the prompt and any earlier messages. Ask only for what is still open, in
 **one** numbered message; the user answers `1.X 2.Y 3.Z`.
@@ -112,6 +119,17 @@ JSON
 Exit 1 means `brief.json` exists and differs: show the printed diff, ask, then re-run with
 `--overwrite`. Exit 2 is invalid JSON or a missing folder; fix and re-run. Read back the summary
 line (`created:` / `overwritten:` / `unchanged:`).
+
+## 3b. Speech tools
+
+Before analyze, and never skipped (the interview stays the first reply):
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/speech.py" check
+```
+
+Exit 1 prints the problems and install commands: show the output, ask the user to install,
+re-run `check`, and continue only on exit 0.
 
 ## 4–6. Analyze, grade, plan
 

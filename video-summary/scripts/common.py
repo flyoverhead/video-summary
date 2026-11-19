@@ -9,7 +9,9 @@ PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 LUT_PATH = PLUGIN_ROOT / 'assets' / 'luts' / 'dji-osmo-action6-dlogm-to-rec709.cube'
 FFMPEG_BIN = '/opt/homebrew/opt/ffmpeg-full/bin'
 CAMERA_ROOT = Path.home() / 'Movies' / 'camera'
-CACHE_ROOT = Path.home() / '.cache' / 'video-summary'
+CACHE_ROOT = (Path(os.environ['VIDEO_SUMMARY_CACHE_DIR']).expanduser()
+              if os.environ.get('VIDEO_SUMMARY_CACHE_DIR')
+              else Path.home() / '.cache' / 'video-summary')
 
 ALLOWED_OUTPUTS = frozenset({
     'brief.json',
@@ -38,6 +40,11 @@ def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, **kw)
 
 
+def manifest_path(config: dict, draft: bool) -> Path:
+    name = 'render-manifest.draft.json' if draft else 'render-manifest.final.json'
+    return Path(config['tmp']).expanduser() / name
+
+
 def output_path(project: Path, name: str) -> Path:
     if name in ALLOWED_OUTPUTS or name in VIDEO_OUTPUTS:
         return Path(project) / name
@@ -59,13 +66,16 @@ def read_json(path: Path) -> Any:
     return json.loads(Path(path).read_text())
 
 
-def cache_dir(project: Path) -> Path:
+def cache_slug(project: Path) -> str:
     project = Path(project).resolve()
     try:
-        slug = str(project.relative_to(CAMERA_ROOT.resolve())).replace('/', '-')
+        return str(project.relative_to(CAMERA_ROOT.resolve())).replace('/', '-')
     except ValueError:
-        slug = f'{project.name}-{hashlib.sha1(str(project).encode()).hexdigest()[:8]}'
-    path = CACHE_ROOT / slug
+        return f'{project.name}-{hashlib.sha1(str(project).encode()).hexdigest()[:8]}'
+
+
+def cache_dir(project: Path) -> Path:
+    path = CACHE_ROOT / cache_slug(project)
     path.mkdir(parents=True, exist_ok=True)
     return path
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import math
 import re
 import shutil
 import statistics
@@ -10,9 +11,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from common import cache_dir, defaults, output_path, read_json, run, write_output  # noqa: E402
+import speech  # noqa: E402
 from probe import _ffprobe, collect_probe  # noqa: E402
 
-PRIORITY = {'scene': 0, 'loud': 1, 'baseline': 2}
+PRIORITY = {'scene': 0, 'loud': 1, 'speech': 2, 'baseline': 3}
 END_MARGIN = 0.05
 LOUD_WINDOW_S = 0.2
 LOUD_MIN_SEPARATION_S = 1.0
@@ -69,6 +71,31 @@ def loud_times(path: Path, top_k: int, over_median: float) -> list[float]:
     return sorted(round(max(0.0, t - LOUD_WINDOW_S), 3) for t in chosen)
 
 
+class MissingTranscripts(RuntimeError):
+    def __init__(self, files: list[str]):
+        super().__init__(f'no transcript for {len(files)} clips (first: {files[0]})')
+        self.files = files
+
+
+def speech_times(segments: list[dict], duration: float, min_gap: float, max_per_min: float) -> list[float]:
+    kept: list[dict] = []
+    for seg in sorted(segments, key=lambda s: s['start']):
+        if not kept or seg['start'] - kept[-1]['start'] >= min_gap:
+            kept.append(seg)
+    cap = math.ceil(duration / 60 * max_per_min)
+    if len(kept) > cap:
+        kept = sorted(kept, key=lambda s: (-(s['end'] - s['start']), s['start']))[:cap]
+    return sorted(round(s['start'], 3) for s in kept)
+
+
+def _require_transcripts(root: Path, files: list[str] | None = None) -> None:
+    missing = speech.needs_transcript(root)
+    if files is not None:
+        missing = [f for f in missing if f in files]
+    if missing:
+        raise MissingTranscripts(missing)
+
+
 def baseline_times(duration: float, every: float) -> list[float]:
     if duration < every:
         return [round(duration / 2, 3)]
@@ -117,9 +144,15 @@ def force_excluded(root: Path, clips: list[dict]) -> list[str]:
             or any(parent.as_posix() in entries for parent in Path(c['file']).parents)]
 
 
-def _clip_times(path: Path, duration: float, cfg: dict) -> list[tuple[float, str]]:
+def _clip_times(root: Path, file: str, duration: float, cfg: dict) -> list[tuple[float, str]]:
+    path = Path(root) / file
+    transcript = speech.load_transcript(root, file)
     tagged = [(t, 'scene') for t in scene_times(path, cfg['scene_threshold'])]
     tagged += [(t, 'loud') for t in loud_times(path, cfg['loud_top_k'], cfg['loud_min_lufs_over_median'])]
+    if transcript:
+        scfg = defaults()['speech']
+        tagged += [(t, 'speech') for t in
+                   speech_times(transcript['segments'], duration, cfg['min_gap_s'], scfg['max_per_min'])]
     tagged += [(t, 'baseline') for t in baseline_times(duration, cfg['baseline_every_s'])]
     return merge_times(tagged, duration, cfg['min_gap_s'])
 
@@ -135,7 +168,8 @@ def _candidate(root: Path, cid: str, clip: dict, t: float, source: str, width: i
         if skipped is not None:
             skipped.append(note)
         return None
-    return {'id': cid, 'file': clip['file'], 't': t, 'source': source, 'thumb': str(thumb)}
+    return {'id': cid, 'file': clip['file'], 't': t, 'source': source, 'thumb': str(thumb),
+            'speech_seen': True}
 
 
 def sample_project(root: Path, overwrite: bool = False, skipped: list[str] | None = None) -> dict:
@@ -143,6 +177,7 @@ def sample_project(root: Path, overwrite: bool = False, skipped: list[str] | Non
     if output_path(root, 'moments.json').exists() and not overwrite:
         raise FileExistsError(str(root / 'moments.json'))
     cfg = defaults()['sampling']
+    _require_transcripts(root)
     if overwrite:
         shutil.rmtree(cache_dir(root) / 'scores', ignore_errors=True)
     candidates = []
@@ -151,8 +186,7 @@ def sample_project(root: Path, overwrite: bool = False, skipped: list[str] | Non
     for clip in clips:
         if clip['file'] in excluded:
             continue
-        path = root / clip['file']
-        for t, source in _clip_times(path, clip['duration'], cfg):
+        for t, source in _clip_times(root, clip['file'], clip['duration'], cfg):
             cand = _candidate(root, f'c{len(candidates) + 1:04d}', clip, t, source, cfg['thumb_width'], skipped)
             if cand:
                 candidates.append(cand)
@@ -169,6 +203,7 @@ def rescan(root: Path, files: list[str], every: float, skipped: list[str] | None
     unknown = [f for f in files if f not in clips]
     if unknown:
         raise ValueError(f'not in probe: {", ".join(unknown)}')
+    _require_transcripts(root, files)
     last = max((int(c['id'][1:]) for c in data['candidates']), default=0)
     new = []
     for file in files:
@@ -188,28 +223,79 @@ def rescan(root: Path, files: list[str], every: float, skipped: list[str] | None
     return new
 
 
+def add_speech(root: Path, skipped: list[str] | None = None) -> tuple[list[dict], list[str]]:
+    root = Path(root)
+    _require_transcripts(root)
+    cfg = defaults()['sampling']
+    scfg = defaults()['speech']
+    data = read_json(root / 'moments.json')
+    clips = _load_probe(root)['clips']
+    excluded = set(force_excluded(root, clips))
+    last = max((int(c['id'][1:]) for c in data['candidates']), default=0)
+    scores = data.get('scores', {})
+    presampled = not any(c['source'] == 'speech' or c.get('speech_seen') for c in data['candidates'])
+    new = []
+    requeued = []
+    for clip in clips:
+        transcript = speech.load_transcript(root, clip['file'])
+        if clip['file'] in excluded or not transcript:
+            continue
+        segments = transcript['segments']
+        existing = [c for c in data['candidates'] if c['file'] == clip['file']]
+        have = [c['t'] for c in existing]
+        top = max(0.0, clip['duration'] - END_MARGIN)
+        for c in existing:
+            if presampled and c['id'] in scores and not c.get('speech_seen') and speech.said_at(
+                    segments, c['t'], scfg['said_before_s'], scfg['said_after_s'], scfg['said_max_chars']):
+                del scores[c['id']]
+                requeued.append(c['id'])
+            c['speech_seen'] = True
+        for t in speech_times(segments, clip['duration'], cfg['min_gap_s'], scfg['max_per_min']):
+            t = round(min(t, top), 3)
+            if any(abs(t - h) < cfg['min_gap_s'] for h in have):
+                continue
+            cand = _candidate(root, f'c{last + 1:04d}', clip, t, 'speech', cfg['thumb_width'], skipped)
+            if cand:
+                last += 1
+                new.append(cand)
+                have.append(t)
+    data['candidates'] += new
+    write_output(root, 'moments.json', data, overwrite=True)
+    return new, requeued
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description='Pick candidate moments and extract thumbnails')
     parser.add_argument('project')
     parser.add_argument('--overwrite', action='store_true')
     parser.add_argument('--rescan', nargs='+', metavar='FILE')
+    parser.add_argument('--add-speech', action='store_true')
     parser.add_argument('--every', type=float, default=2.0)
     args = parser.parse_args()
     root = Path(args.project).expanduser()
     skipped: list[str] = []
-    if args.rescan:
-        new = rescan(root, args.rescan, args.every, skipped)
-        print(f'added {len(new)} candidates')
-    else:
-        try:
-            data = sample_project(root, overwrite=args.overwrite, skipped=skipped)
-        except FileExistsError as exc:
-            raise SystemExit(f'exists, use --overwrite: {exc}')
-        counts = {s: sum(1 for c in data['candidates'] if c['source'] == s) for s in PRIORITY}
-        print(f'{len(data["candidates"])} candidates: {counts}')
-        excluded = force_excluded(root, _load_probe(root)['clips'])
-        if excluded:
-            print(f'not sampled (force_exclude): {", ".join(excluded)}')
+    try:
+        if args.add_speech:
+            new, requeued = add_speech(root, skipped)
+            print(f'added {len(new)} speech candidates, {len(requeued)} scored candidates '
+                  're-queued for scoring with speech')
+        elif args.rescan:
+            new = rescan(root, args.rescan, args.every, skipped)
+            print(f'added {len(new)} candidates')
+        else:
+            try:
+                data = sample_project(root, overwrite=args.overwrite, skipped=skipped)
+            except FileExistsError as exc:
+                raise SystemExit(f'exists, use --overwrite: {exc}')
+            counts = {s: sum(1 for c in data['candidates'] if c['source'] == s) for s in PRIORITY}
+            print(f'{len(data["candidates"])} candidates: {counts}')
+            excluded = force_excluded(root, _load_probe(root)['clips'])
+            if excluded:
+                print(f'not sampled (force_exclude): {", ".join(excluded)}')
+    except MissingTranscripts as exc:
+        print(f'ERROR: no transcript for {len(exc.files)} clips (first: {exc.files[0]}); '
+              f'run speech.py transcribe "{root}"', file=sys.stderr)
+        raise SystemExit(2)
     if skipped:
         print(f'skipped {len(skipped)} timestamp{"s" if len(skipped) > 1 else ""} (no thumbnail):')
         print('\n'.join(f'  {note}' for note in skipped))

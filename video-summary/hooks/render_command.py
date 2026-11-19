@@ -39,6 +39,8 @@ def render_project(command: str, cwd: str) -> Path | None:
 def _project_in(segment: list[str], base: Path) -> Path | None:
     for i, token in enumerate(segment):
         if i and Path(token).name == 'render_summary.py' and PYTHON.fullmatch(Path(segment[i - 1]).name):
-            arg = next((t for t in segment[i + 1:] if not t.startswith('-')), None)
+            rest = segment[i + 1:]
+            skip = {rest.index('--clips') + 1} if '--clips' in rest else set()
+            arg = next((t for n, t in enumerate(rest) if not t.startswith('-') and n not in skip), None)
             return base / Path(arg).expanduser() if arg else base
     return None

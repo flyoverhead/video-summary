@@ -13,6 +13,7 @@ file says what the symptom looks like and where the fix lives, so nobody undoes 
 - [Mixed shapes in one folder](#mixed-shapes-in-one-folder)
 - [Render is slow](#render-is-slow)
 - [LRF proxies and AppleDouble files](#lrf-proxies-and-appledouble-files)
+- [Mute when recording starts](#mute-when-recording-starts)
 
 ## No audio in middle clips
 
@@ -82,3 +83,16 @@ cut, and run every render in the background.
 `._*` AppleDouble files.
 **Handled:** `probe.py` takes only `*.MP4` / `*.mp4`, skips dotfiles and any
 `SUMMARY_VIDEO*.mp4`. Never delete or move these files; they belong to the source folder.
+
+## Mute when recording starts
+
+**Cause:** with a DJI Mic Mini linked, the camera records its own mic for a moment, then hands
+over to the wireless mic and leaves a short gap of digital silence (`-inf` RMS) between the two.
+On the 2026-07 Altai trip (Osmo Action, mono AAC) 82 of 105 files had exactly one 0.6–0.8 s gap,
+always within the first 3.5 s, never later; the level changes across it (camera mic → Mic Mini).
+**Symptom:** a short drop-out of sound at the start of clips cut from 0 s; audible in a draft.
+**Handled:** `moments.py snap` (run by `video-summary:plan`) detects the gap with
+`silencedetect=noise=-90dB:d=0.04` in the first 5 s of each source file and starts every overlapping
+clip 0.1 s after it; `verify.py` and the pre-render hook do not check it.
+**Prevention:** the Osmo Action setting Built-in Mic Audio Backup, set by the user in 2026-11, not
+yet verified on footage.
